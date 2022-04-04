@@ -41,7 +41,7 @@ begin
             else case -- to temporarily prop up the assortment items....Joey B
 		            when right(u.ItemCode,8) > '19999999' then 'Assort' -- 'Assortments to Titles'
 		            else case 
-                            when ISNULL(u.buyer,'')='' then substring(ltrim(b.BuyerID),1,1) + '.' + substring(b.BuyerID,charindex(' ', b.BuyerID)+1,1) + '.'  
+                                        when ISNULL(u.buyer,'')='' then substring(ltrim(b.BuyerID),1,1) + '.' + substring(b.BuyerID,charindex(' ', b.BuyerID)+1,1) + '.'  
 			                else substring(ltrim(u.Buyer),1,1) + '.' + substring(u.buyer,charindex(' ', u.buyer)+1,1) + '.' 
                             end
 	                end 
@@ -77,10 +77,9 @@ begin
         ,isnull(u.DiscAmt,0) as DiscAmt
         ,isnull(u.TXBQty,0) as TXBQty
         ,isnull(u.TXBAmt,0) as TXBAmt
-	    ,OnlineQtySold
+	,OnlineQtySold
         ,SellingPrice
-    from
-        ReportsData..CDC_TradeShowRollUpNEW u --left outer join ReportsData..OrderHeader oh on u.LastPO=oh.PONumber
+    from ReportsData..CDC_TradeShowRollUpNEW u --left outer join ReportsData..OrderHeader oh on u.LastPO=oh.PONumber
         left outer join ReportsData..Buyers b on b.Name=u.Buyer
         left outer join rILS_DATA..WMSAvailableQty w on w.ItemCode=u.ItemCode and w.Company='TTB'
     where (right(u.ItemCode,8) > '19999999' 
