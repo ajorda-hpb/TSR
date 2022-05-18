@@ -4,19 +4,30 @@ go
 set QUOTED_IDENTIFIER off
 go
 
-create procedure [dbo].[CDC_TradeShowRollUpNew](
+create or alter procedure [dbo].[Rebuild_CDC_TradeShowRollUpNew](
 	@StartDate	 datetime='1/1/2008'
 ) as
 /*	ChangeLog:
-	2/15/2012 : Added MSRP to results for TSR. : Joey B. 
-	8/13/2012 : Made change to include dropship items : Joey B.
-	11/9/2016 : Made changes to include coupons, discounts, & TXB : Joey B.
-	2/21/2018 : Added Online Quantity and Selling Price: Trey G.
+	02/15/2012 : Added MSRP to results for TSR. : Joey B. 
+	08/13/2012 : Made change to include dropship items : Joey B.
+	11/09/2016 : Made changes to include coupons, discounts, & TXB : Joey B.
+	02/21/2018 : Added Online Quantity and Selling Price: Trey G.
+	03/16/2022 : Many Changes. Renamed sproc to 'Rebuild_CDC_TradeshowRollUpNew' Alicia J.
+		[x] edit QtySold/ExtAmt/RegAmt to include Bookworm orders (Search & Ship and Ship to Store)
+		[x] edit PctSold to include online & bookworm sales. (implicit since it's added to QtySold)
+		[x] check if OnHand (i.e. the ProductInventory table) backs out bookworm (no) & online sales (yes)
+		[x] combine queries that pull warehouse shipments separately from dropshipments
+		[x] fix query that pulls TTB sales metrics
+		[x] fix query that updates QtyShip for dropshipments to not just blindly grab everything from store receiving
+		[ ] CDC_OOS_ItemLog hasn't been updated since 8/9/2016... fix/ignore/delete?
+		[ ] Generic assortment items show up as the generic item code, but no sales are ever reported. Remove items? Roll up sales?
+		[ ] Duplicate item codes somehow come from the Wholsale data, each line has different sales info.
+		[ ] Back out Bookworm sales quantities from OnHand, since they're not accounted for (see email from Bijoy on 4/28/2022)
+
 */
 
 ----------testing
---declare @StartDate datetime
---set @StartDate = '1/1/2008'
+--   declare @StartDate datetime = '1/1/2008'
 
 declare @i_StartDate 		datetime--purchases start date
 declare @i_EndDate 			datetime--purchases end date
@@ -25,17 +36,15 @@ declare @i_ReportType 		int
 --assortments=1, titles=2
 
 select
-	@i_StartDate=@StartDate
-	,@i_EndDate=CAST(convert(varchar,GetDate(),101)as datetime)
-	,@i_SalesEnding=CAST(convert(varchar,GetDate(),101)as datetime)
+	 @i_StartDate = 	@StartDate
+	,@i_EndDate = 		CAST(convert(varchar,GetDate(),101)as datetime)
+	,@i_SalesEnding =	CAST(convert(varchar,GetDate(),101)as datetime)
 
+select CAST(convert(varchar,GetDate(),101)as datetime)
 
 /*CREATE TABLES & INDEXES TO DO THE WORK*/
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_PENDING]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_PENDING
-
-create table CDC_SDV_PENDING(
+drop table if exists #CDC_SDV_PENDING
+create table #CDC_SDV_PENDING(
 	 [VendorID]        [varchar] (10)  not null 
 	,[ReorderVendorID] [varchar] (10)  not null 
 	,[ItemCode]        [varchar] (20)  not null 
@@ -68,15 +77,11 @@ create table CDC_SDV_PENDING(
 	,[Publisher]       [varchar] (250) null
 	,[Author]          [varchar] (250) null
 )
+create  clustered  index [IDX_TEMP_PENDING] on #CDC_SDV_PENDING ([VendorID], [ItemCode])
 
-create  clustered  index [IDX_TEMP_PENDING] on CDC_SDV_PENDING ([VendorID], [ItemCode])
-
-
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_WORK]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_WORK
-
-create table CDC_SDV_WORK(
+ 
+drop table if exists #CDC_SDV_WORK
+create table #CDC_SDV_WORK(
 	 [VendorID]        [varchar] (10)  not null 
 	,[ReorderVendorID] [varchar] (10)  not null 
 	,[ItemCode]        [varchar] (20)  not null 
@@ -103,7 +108,7 @@ create table CDC_SDV_WORK(
 	,[LastPO]          [char] (6)      null 
 	,[LastReceived]    [smalldatetime] null 
 	,[FirstReceived]   [smalldatetime] null 
-	,[PctSold] as (case ISNULL(QtyShipped,0) when 0 then ISNULL(QtySold,0)else (convert(float,[QtySold]) / convert(float,[QtyShipped]) * 100)end) 
+	,[PctSold] as (case ISNULL(QtyShipped,0) when 0 then ISNULL(QtySold,0) else (convert(float,[QtySold]) / convert(float,[QtyShipped]) * 100)end) 
 	,[SchemeID]        [varchar] (20)  null
 	,[TTBInv]          [int]           null
 	,[FOBItem]         [varchar] (250) null
@@ -115,28 +120,21 @@ create table CDC_SDV_WORK(
 	,[QtyDisc]         [int]           null 
 	,[DiscAmt]         [money]         null
 )
+create  clustered  index [IDX_TEMP_PIG] on #CDC_SDV_WORK ([VendorID], [ItemCode])
 
-create  clustered  index [IDX_TEMP_PIG] on CDC_SDV_WORK ([VendorID], [ItemCode])
 
-
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_SALES]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_SALES
-
-create table CDC_SDV_SALES(
+drop table if exists #CDC_SDV_SALES
+create table #CDC_SDV_SALES(
 	ExtendedAmt   money
 	,RegisterPrice money
 	,QuantitySold  int
 	,ItemCode      varchar(20)
 )
-create  clustered  index [IDX_PIG_SALES] on CDC_SDV_SALES( [ItemCode])
+create  clustered  index [IDX_PIG_SALES] on #CDC_SDV_SALES( [ItemCode])
 
 
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_SalesData]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_SalesData
-
-create table CDC_SDV_SalesData(
+drop table if exists #CDC_SDV_SalesData
+create table #CDC_SDV_SalesData(
 	ExtendedAmt   money
 	,RegisterPrice money
 	,QuantitySold  int
@@ -148,28 +146,19 @@ create table CDC_SDV_SalesData(
 	,DiscAmt       money
 	,ItemCode      varchar(20)
 )
-create  clustered  index [IDX_PIG_SalesData] on CDC_SDV_SalesData( [ItemCode])
+create  clustered  index [IDX_PIG_SalesData] on #CDC_SDV_SalesData( [ItemCode])
 
 
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_RETURNS]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_RETURNS
-
-create table CDC_SDV_RETURNS(
+drop table if exists #CDC_SDV_RETURNS
+create table #CDC_SDV_RETURNS(
 	Returned int
 	,ItemCode varchar(20)
 )
-create  clustered  index [IDX_PIG_RETS] on CDC_SDV_RETURNS ( [ItemCode])
+create  clustered  index [IDX_PIG_RETS] on #CDC_SDV_RETURNS ( [ItemCode])
 
 
 --create temp table to hold shipment history instead of using table function.  this cuts the runtime from 30 min to 5.....
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[#ShipHist]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table #ShipHist
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[#ILSRcvHist]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table #ILSRcvHist
-
+drop table if exists #ShipHist
 create table #ShipHist(
 	QtyShipped int
 	,ItemCode   char(20)
@@ -177,6 +166,7 @@ create table #ShipHist(
 )
 create  clustered  index [IDX_items] on #ShipHist ( [ItemCode])
 
+drop table if exists #ILSRcvHist
 create table #ILSRcvHist(
 	QtyRcvd  int
 	,ItemCode char(20)
@@ -213,7 +203,7 @@ from(
 		where rc.company <> 'SUP' 
 			and right('00000000000000000000' + rc.item, 20) not in (select itemcode from #ShipHist)
 		group by right('00000000000000000000' + rc.item, 20)
-	union
+	union all
 		select
 			sum(isnull(ar.total_qty,0))[total_qty]
 			,right('00000000000000000000' + ar.item, 20)[item]
@@ -225,14 +215,9 @@ from(
 group by r.item
 
 
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[#Received]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table #Received
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[#LastProcessedDate]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table #LastProcessedDate
 ----set received dates and parent......
 /*Next for Last Received*/
+drop table if exists #Received
 create table #Received(
 	 itemcode      char(20)
 	,firstreceived datetime
@@ -242,6 +227,7 @@ create table #Received(
 )
 create  clustered  index [IDX_items] on #Received ( [ItemCode])
 
+--**Combined queries for shipments from CDC Warehouse or Dropshipped
 insert into #Received
 select
 	distinct
@@ -252,66 +238,36 @@ select
 	,isnull(sum(r.RcvdQty),0)
 from(
 		select
-			distinct
+			-- distinct
 			sd.itemcode [ItemCode]
 			,min(sd.ProcessDate)[firstreceived]
 			,max(sd.ProcessDate)[lastReceived]
-			,'SR' [Parent]
+			,case sh.ShipmentType when 'W' then 'SR' else 'DS' end[Parent]
 			,isnull(SUM(sd.Qty),0)[RcvdQty]
 		from ReportsData..SR_Header_Historical sh with (nolock) 
 			inner join ReportsData..SR_Detail_Historical sd with (nolock) on sh.BatchID = sd.BatchID
-		where sh.ShipmentType in ('W')
-		group by sd.ItemCode
-	union
+		where sh.ShipmentType in ('W','R')
+		group by sd.ItemCode,case sh.ShipmentType when 'W' then 'SR' else 'DS' end
+	union all
 		select
-			distinct
+			-- distinct
 			sd.itemcode [ItemCode]
 			,min(sd.ProcessDate)[firstreceived]
 			,max(sd.ProcessDate)[lastReceived]
-			,'SR' [Parent]
+			,case sh.ShipmentType when 'W' then 'SR' else 'DS' end[Parent]
 			,isnull(SUM(sd.Qty),0)[RcvdQty]
 		from ReportsData..SR_Header sh with (nolock) 
 			inner join ReportsData..SR_Detail sd with (nolock) on sh.BatchID = sd.BatchID
-		where sh.ShipmentType in ('W')
-		group by sd.ItemCode
+		where sh.ShipmentType in ('W','R')
+		group by sd.ItemCode,case sh.ShipmentType when 'W' then 'SR' else 'DS' end
 	) r
 group by r.ItemCode,r.Parent
 
-insert into #Received
-select
-	distinct
-	r.ItemCode
-	,min(r.firstreceived)
-	,max(r.lastReceived)
-	,r.Parent
-	,isnull(sum(r.RcvdQty),0)
-from(
-		select
-			distinct
-			sd.itemcode [ItemCode]
-			,min(sd.ProcessDate)[firstreceived]
-			,max(sd.ProcessDate)[lastReceived]
-			,'DS' [Parent]
-			,isnull(SUM(sd.Qty),0)[RcvdQty]
-		from ReportsData..SR_Header sh with (nolock) 
-			inner join ReportsData..SR_Detail sd with (nolock) on sh.BatchID = sd.BatchID
-		where sh.ShipmentType in ('R')
-		group by sd.ItemCode
-	union
-		select
-			distinct
-			sd.itemcode [ItemCode]
-			,min(sd.ProcessDate)[firstreceived]
-			,max(sd.ProcessDate)[lastReceived]
-			,'DS' [Parent]
-			,isnull(SUM(sd.Qty),0)[RcvdQty]
-		from ReportsData..SR_Header_Historical sh with (nolock) 
-			inner join ReportsData..SR_Detail_Historical sd with (nolock) on sh.BatchID = sd.BatchID
-		where sh.ShipmentType in ('R')
-		group by sd.ItemCode) r
-group by r.ItemCode,r.Parent
 
-
+-- ** Anything not yet (ever) received by stores, but is on an ILS receipt gets added.
+-- ** This is how the generic assortment items get their own line, so this would be where to exclude them if wanted.
+-- ** Open receipts will have their own line until/unless lines get delete/removed/closed
+-- ** SUP items will be on here also.
 insert into #received
 select
 	wr.ItemCode
@@ -341,6 +297,7 @@ from(
 		group by right('00000000000000000000' + item, 20))wr
 group by wr.ItemCode,wr.Parent
 
+-- **This covers distro received at RDCs, such as where new item codes were created before being sent on to stores.
 insert into #received
 select
 	distinct
@@ -355,6 +312,7 @@ where rh.distributionposteddate > @i_StartDate
 	and rd.itemcode not in (select distinct itemcode from #received)
 group by rd.ItemCode
 
+drop table if exists #LastProcessedDate
 select
 	distinct
 	itemcode
@@ -368,8 +326,7 @@ group by itemcode, parent
 
 ---------------------------------------------------------------------------------------------------------
 /*GET THE INITIAL ITEMS TO WORK ON*/
--- !! Items with multiple POs will end up with duplicate lines if 2+ of those POs have SpecInstrs
-insert into CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,SectionCode,Title,Cost,Price,MSRP
+insert into #CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,SectionCode,Title,Cost,Price,MSRP
 						,QtyShipped,AmtInvoiced,SchemeID,Reorderable,LastReceived,FirstReceived,FOBPO,FOBItem)
 select
 	pm.VendorID
@@ -418,7 +375,7 @@ where pm.ItemCode not in (select distinct NewItemCode from ReportsData..RecvDtlI
 
 
 ----CDC rcvd info
-insert into CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,SectionCode,Title,Cost,Price,MSRP
+insert into #CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,SectionCode,Title,Cost,Price,MSRP
 						,QtyShipped,AmtInvoiced,SchemeID,Reorderable,LastReceived,FirstReceived,FOBPO,FOBItem)
 select
 	pm.VendorID
@@ -461,7 +418,7 @@ where (pm.CreateDate between @i_StartDate and @i_EndDate
 		or lastrcv.lastRcvd between @i_StartDate and @i_EndDate)
 
 /*CAN ANY BASE INVENTORY*/
-delete CDC_SDV_WORK 
+delete #CDC_SDV_WORK 
 where ItemCode in (select ItemCode from ReportsData..BaseInventory with (nolock)) 
 	or SCHEMEID='BASE INVENTORY' or VendorID = 'WHPBSUPPLY' or ReorderVendorID='WHPBSUPPLY'
 
@@ -470,7 +427,7 @@ where ItemCode in (select ItemCode from ReportsData..BaseInventory with (nolock)
 --get non-damage transfers.....
 update s
 set s.QtyTrans=isnull(it.QtyShipped,0)
-from CDC_SDV_WORK s
+from #CDC_SDV_WORK s
 	inner join (select SUM(ISNULL(sd.QTY,0))as QtyShipped
 					,sd.ItemCode
 				from ReportsData..ShipmentDetail sd
@@ -488,7 +445,7 @@ from CDC_SDV_WORK s
 --get damage transfers.....
 update s
 set s.QtyDamaged=isnull(it.QtyShipped,0)
-from CDC_SDV_WORK s
+from #CDC_SDV_WORK s
 	inner join (select SUM(ISNULL(sd.QTY,0))as QtyShipped
 					,sd.ItemCode
 				from ReportsData..ShipmentDetail sd
@@ -505,21 +462,28 @@ from CDC_SDV_WORK s
 
 
 /*Next update dropship qty with store received qty*/
--- !!Updates ALL of the ShipQty to the StoreRcvQty if ANY shipments of an item were dropshipped.
+-- !! Updates ALL of the ShipQty to the StoreRcvQty if ANY shipments of an item were dropshipped.
+-- !! Also includes ALL shipments (e.g. transfers to stores, trash, &c.)./
+-- !! Instead use the #Received table, since that's already got SR_% data for the RIGHT shipments.
 update s
-set s.QtyShipped =(select sum(x.Qty)
-					from((select isnull(SUM(Qty),0)[Qty]
-							from ReportsData..SR_Detail
-							where itemcode=s.itemcode)
-						union
-						 (select isnull(SUM(Qty),0)[Qty]
-							from ReportsData..SR_Detail_Historical
-							where itemcode=s.itemcode)) x)
-from CDC_SDV_WORK s --join #Received r on s.ItemCode=r.itemcode
+set s.QtyShipped = rcvd.RcvdQty
+				--    (select sum(x.Qty)
+				-- 	from((select isnull(SUM(Qty),0)[Qty]
+				-- 			from ReportsData..SR_Detail
+				-- 			where itemcode=s.itemcode)
+				-- 		union
+				-- 		 (select isnull(SUM(Qty),0)[Qty]
+				-- 			from ReportsData..SR_Detail_Historical
+				-- 			where itemcode=s.itemcode)) x)
+from #CDC_SDV_WORK s --join #Received r on s.ItemCode=r.itemcode
 	inner join (select distinct ItemCode
 				from #ShipHist
 				where DropShip=1
 		)ship on ship.ItemCode=s.ItemCode
+	inner join (select ItemCode,sum(rcvdqty)RcvdQty 
+				from #Received 
+				group by ItemCode
+		)rcvd on rcvd.ItemCode=s.ItemCode
 where LTRIM(RTRIM(s.Parent)) in ('DS','SHIP')
 
 
@@ -533,12 +497,12 @@ set s.parent = case(pd.parent) when 'DS' then ' ' when 'SR' then ' ' when 'DR' t
 	,s.FirstReceived=(select min(firstRcvd)
 						from #LastProcessedDate
 						where itemcode=s.ItemCode)
-from CDC_SDV_WORK s 
+from #CDC_SDV_WORK s 
 	inner join #LastProcessedDate pd on pd.itemcode=s.itemcode
 
-update CDC_SDV_WORK set parent = ' ' where lastreceived is null and (Reorderable = 'N' or QtyShipped = 0)
-update CDC_SDV_WORK set parent = 'SRPR' where lastreceived is null and Reorderable = 'Y' and QtyShipped > 0
---update CDC_SDV_WORK set Parent = ' ' where Parent='RCVD' and ItemCode in (select distinct itemcode from #ShipHist)
+update #CDC_SDV_WORK set parent = ' ' where lastreceived is null and (Reorderable = 'N' or QtyShipped = 0)
+update #CDC_SDV_WORK set parent = 'SRPR' where lastreceived is null and Reorderable = 'Y' and QtyShipped > 0
+--update #CDC_SDV_WORK set Parent = ' ' where Parent='RCVD' and ItemCode in (select distinct itemcode from #ShipHist)
 
 drop table #ShipHist
 drop table #ILSRcvHist
@@ -546,28 +510,25 @@ drop table #Received
 drop table #LastProcessedDate
 
 
-if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_ONHAND]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_ONHAND
-
+drop table if exists #CDC_SDV_ONHAND
 /*next 2 for on hand*/
 select
 	SUM(isnull(pv.QuantityOnHand,0))[Qty]
 	,pv.ItemCode
-into CDC_SDV_ONHAND
+into #CDC_SDV_ONHAND
 from ReportsData..ProductInventory pv  with (nolock) 
-	inner join (select distinct itemcode from CDC_SDV_WORK) s on s.ItemCode = pv.ItemCode
+	inner join (select distinct itemcode from #CDC_SDV_WORK) s on s.ItemCode = pv.ItemCode
 group by pv.ItemCode
 
-update CDC_SDV_WORK
+update #CDC_SDV_WORK
 set OnHand = q.Qty 
-from CDC_SDV_WORK s 
-	inner join CDC_SDV_ONHAND q on s.ItemCode=q.ItemCode
+from #CDC_SDV_WORK s 
+	inner join #CDC_SDV_ONHAND q on s.ItemCode=q.ItemCode
 
-drop table CDC_SDV_ONHAND
+drop table #CDC_SDV_ONHAND
 
-update CDC_SDV_WORK set QtyTrans=0 where QtyTrans is null
-update CDC_SDV_WORK set OnHand=0 where OnHand is null
+update #CDC_SDV_WORK set QtyTrans=0 where QtyTrans is null
+update #CDC_SDV_WORK set OnHand=0 where OnHand is null
 
 
 ----get UPC/ISBN items..................................................................
@@ -583,7 +544,7 @@ where pm.ItemCode in (select distinct right('00000000000000000000' + replace(Ite
 
 
 --------------------------------------------------------------------------------------------------------------------------------------
-insert into CDC_SDV_SalesData
+insert into #CDC_SDV_SalesData
 select
 	sum(t.ExtendedAmt)[ExtendedAmt]
 	,sum(t.RegisterPrice)[RegisterPrice]
@@ -608,11 +569,11 @@ from(
 			,cast(sum(case when sih.DiscountAmt > 0 and sih.IsReturn='N' then sih.DiscountAmt else 0 end)as money) [DiscAmt]
 			,sih.ItemCode
 		from rHPB_Historical.dbo.SalesItemHistory sih with (nolock)
-			inner join (select distinct itemcode from CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
+			inner join (select distinct itemcode from #CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
 		where sih.XactionType='S' and sih.status='A' and sih.BusinessDate >= @i_StartDate and sih.BusinessDate <=@i_SalesEnding
 			and sih.ItemCode not in (select distinct itemcode from #upcItems)
 		group by sih.ItemCode
-	union
+	union all
 		select
 			cast(sum(case when sih.IsReturn='N' then sih.ExtendedAmt else 0 end)as money)[ExtendedAmt]
 			,cast(sum(case when sih.IsReturn='N' then sih.RegisterPrice else 0 end)as money)[RegisterPrice]
@@ -640,22 +601,24 @@ set w.QtySold=s.QuantitySold
 	,w.QtyDisc=s.QtyDisc
 	,w.DiscAmt=s.DiscAmt
 	,w.QtyMarkedDown=s.MarkedDown
-from CDC_SDV_WORK w 
-	inner join CDC_SDV_SalesData s on w.ItemCode=s.ItemCode
+from #CDC_SDV_WORK w 
+	inner join #CDC_SDV_SalesData s on w.ItemCode=s.ItemCode
 
 
-if OBJECT_ID('tempdb..#online_sales') is not null drop table #online_sales
+drop table if exists #online_sales
 create table #online_sales(
-	ItemCode        nvarchar(25)
-	,SellingPrice    money 
-	,[OnlineQtySold] numeric(19)
-	,DateSold        datetime,
+	ItemCode        	nvarchar(25)
+	,SellingPrice   	money 
+	,ExtendedAmt		money
+	,[OnlineQtySold] 	numeric(19)
+	,DateSold        	datetime,
 )
 
 insert into #online_sales
 select
 	ItemCode
-	,(cast(avg(SellingPrice)as money)) [ExtendedAmt]
+	,(cast(avg(SellingPrice)as money)) [SellingPrice]
+	,(cast(sum(SellingPrice)as money)) [ExtendedAmt]
 	,sum(Quantity) [OnlineQtySold]
 	,max(DateSold)
 from reportsdata..Sales_OnlineMarketPlaces_Distribution sod with(nolock)
@@ -665,36 +628,81 @@ group by ItemCode
 order by ItemCode
 
 
+-- Bookworm Sales (Search & Ship and Ship to Store)
+drop table if exists #bookworm_sales
+create table #bookworm_sales(
+	ExtendedAmt		money
+	,QtySold  		int
+	,ItemCode		varchar(20)
+)
+
+insert into #bookworm_sales 
+select 
+    cast(sum(case when sih.IsReturn='N' then bw.Price else 0 end)as money)[ExtendedAmt]
+	,sum(case when sih.IsReturn='N' then sih.Quantity else 0 end)[QtySold]
+	,pm.ItemCode 
+from rHPB_Historical..SalesHeaderHistory shh 
+    inner join rHPB_Historical..SalesItemHistory sih 
+        on sih.LocationID = shh.LocationID
+        and sih.BusinessDate = shh.BusinessDate
+        and sih.SalesXactionId = shh.SalesXactionID
+    inner join ReportsData..BookWormOrders bw 
+        on sih.LocationID = bw.locationId
+        and sih.SalesXactionId = bw.tillnumber + right('000000000' + bw.transactionNumber,9) 
+        and sih.LineNumber = bw.detailNumber
+    inner join ReportsData..ProductMaster pm on right(replicate('0', 20) + bw.SKU, 20) = pm.ItemCode 
+	inner join (select distinct itemcode from #CDC_SDV_WORK) s on s.ItemCode = pm.ItemCode
+where shh.Status = 'A'
+    and shh.XactionType = 'S'
+	and sih.ItemCode = '00000000000010222778' 
+	and sih.BusinessDate >= @i_StartDate
+	and sih.BusinessDate < @i_SalesEnding
+group by 
+    pm.ItemCode
+
+
+
+-- Add online & bookworm sales to sales metrics
+update w 
+set w.QtySold = w.QtySold + isnull(os.OnlineQtySold,0) + isnull(bs.QtySold,0)
+	,w.RegisterPrice = w.RegisterPrice + isnull(os.ExtendedAmt,0) + isnull(bs.ExtendedAmt,0)
+	,w.ExtendedAmt = w.ExtendedAmt + isnull(os.ExtendedAmt,0) + isnull(bs.ExtendedAmt,0)
+from #CDC_SDV_WORK w 
+	left join #online_sales os on w.ItemCode=os.ItemCode
+	left join #bookworm_sales bs on w.ItemCode=bs.ItemCode
+where os.ItemCode is not null or bs.ItemCode is not null
+
+
 ---------------------------------------------------------------------------------------------------------------------------------------
 
 --/*Insert sales data for the work items*/
---INSERT INTO CDC_SDV_SALES
+--INSERT INTO #CDC_SDV_SALES
 --SELECT SUM(sih.ExtendedAmt) AS ExtendedAmt, SUM(sih.RegisterPrice) AS RegisterPrice,SUM(sih.Quantity) AS QuantitySold, 
 --sih.ItemCode
 -- FROM rHPB_Historical.dbo.SalesItemHistory sih with (nolock)
---	join (select distinct itemcode from CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
+--	join (select distinct itemcode from #CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
 --WHERE sih.XactionType='S' and sih.status='A' AND ISRETURN='N' AND sih.BusinessDate >= @i_StartDate AND sih.BusinessDate <=@i_SalesEnding
 --GROUP BY sih.ItemCode
 
 --/*now update the work table with the sales numbers*/
---UPDATE CDC_SDV_WORK
+--UPDATE #CDC_SDV_WORK
 --SET QtySold=sih.QuantitySold,RegisterPrice=sih.RegisterPrice,ExtendedAmt=sih.ExtendedAmt
---FROM CDC_SDV_WORK s JOIN CDC_SDV_SALES sih on sih.itemcode=s.itemcode
---DROP TABLE CDC_SDV_SALES
+--FROM #CDC_SDV_WORK s JOIN #CDC_SDV_SALES sih on sih.itemcode=s.itemcode
+--DROP TABLE #CDC_SDV_SALES
 
 --/*DO THE RETURNS THING JUST LIKE SALES*/
---INSERT INTO CDC_SDV_RETURNS
+--INSERT INTO #CDC_SDV_RETURNS
 --SELECT SUM(sih.Quantity) AS Returned,sih.ItemCode
 --FROM rHPB_Historical.dbo.SalesItemHistory sih with (nolock) 
---	join (select distinct itemcode from CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
+--	join (select distinct itemcode from #CDC_SDV_WORK) s on s.ItemCode = sih.ItemCode
 --WHERE sih.XactionType='S' and sih.status='A' AND ISRETURN='Y' AND sih.BusinessDate >= @i_StartDate AND sih.BusinessDate <=@i_SalesEnding
 --GROUP BY sih.ItemCode
 
 --/*UPDATE THE WORK TABLE WITH THE RETURNS NUMBERS*/
---UPDATE CDC_SDV_WORK
+--UPDATE #CDC_SDV_WORK
 --SET QtyReturned=srh.Returned
---FROM CDC_SDV_WORK s JOIN CDC_SDV_RETURNS srh on srh.itemcode=s.itemcode
---DROP TABLE CDC_SDV_RETURNS
+--FROM #CDC_SDV_WORK s JOIN #CDC_SDV_RETURNS srh on srh.itemcode=s.itemcode
+--DROP TABLE #CDC_SDV_RETURNS
 
 /*dump in the Pending stuff*/
 ----first get pending TTB items that have been reorded..............
@@ -760,7 +768,7 @@ from rILS_data..AR_RECEIPT_DETAIL
 where PURCHASE_ORDER_ID is not null
 
 ----get final results......................................................................................................................................
-insert into CDC_SDV_PENDING(FirstReceived,LastReceived,LastPO,VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer
+insert into #CDC_SDV_PENDING(FirstReceived,LastReceived,LastPO,VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer
 							,SectionCode,Title,Cost,Price,MSRP,QtyShipped,AmtInvoiced,SchemeID,Reorderable,FOBPO,FOBItem)
 select
 	oh.PODate
@@ -795,7 +803,7 @@ where oh.LocationNo='00944' and oh.CreatedFromRequisition=0 and r.itemcode is nu
 
 
 ----now get all other pending items excluded those in the previous step......................................................................................
-insert into CDC_SDV_PENDING(FirstReceived,LastReceived,LastPO,VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer
+insert into #CDC_SDV_PENDING(FirstReceived,LastReceived,LastPO,VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer
 							,SectionCode,Title,Cost,Price,MSRP,QtyShipped,AmtInvoiced,SchemeID,Reorderable,FOBPO,FOBItem)
 select
 	oh.PODate
@@ -829,12 +837,12 @@ where od.DistributionType!='A' and isnull(oh.POType,'') not in ('S','C')
 					from ReportsData..ShipmentDetail sd with (nolock) 
 						inner join ReportsData..ShipmentHeader sh with (nolock) on sh.TransferID=sd.TransferID
 					where sd.ItemCode=od.ItemCode)
-	and not exists (select * from CDC_SDV_WORK where ItemCode=pm.ItemCode) 
-	and not exists (select * from CDC_SDV_PENDING where ItemCode=pm.ItemCode)
+	and not exists (select * from #CDC_SDV_WORK where ItemCode=pm.ItemCode) 
+	and not exists (select * from #CDC_SDV_PENDING where ItemCode=pm.ItemCode)
 
 
 /*INSERT WHATEVER PENDING IS LEFT TO THE WORK TABLE*/
-insert into CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer,SectionCode,Title,Cost
+insert into #CDC_SDV_WORK(VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer,SectionCode,Title,Cost
 						,Price,MSRP,QtyShipped,QtyTrans,QtyDamaged,QtySold,QtyReturned,RegisterPrice,ExtendedAmt
 						,OnHand,AmtInvoiced,Reorderable,LastPO,LastReceived,FirstReceived,SchemeID)
 select
@@ -864,13 +872,13 @@ select
 	,LastReceived
 	,FirstReceived
 	,SchemeID
-from CDC_SDV_PENDING
+from #CDC_SDV_PENDING
 
 
 /*CAN THE TEMP POs TABLE IN CASE SOMETHING HAPPENED LAST RUN...*/
 if exists (select * from dbo.sysobjects
-			where id = object_id(N'[dbo].[CDC_SDV_POs]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
-	drop table CDC_SDV_POs
+			where id = object_id(N'[dbo].[#CDC_SDV_POs]') and OBJECTPROPERTY(id, N'IsUserTable') = 1)
+	drop table #CDC_SDV_POs
 
 /*BUILD TEMP TABLE WITH PO RELATED INFO*/
 --LastPO
@@ -880,9 +888,9 @@ select
 	,CAST(''as varchar(250))[FOBPO]
 	,CAST(''as varchar(250))[FOBItem]
 into #tmpPOs
-from CDC_SDV_WORK s 
+from #CDC_SDV_WORK s 
 	inner join ReportsData..ShipmentDetail sd with (nolock) on sd.itemcode=s.itemcode
-where sd.PONumber not in (select distinct LastPO from CDC_SDV_PENDING)
+where sd.PONumber not in (select distinct LastPO from #CDC_SDV_PENDING)
 group by sd.ItemCode
 
 insert into #tmpPOs
@@ -891,10 +899,10 @@ select
 	,sd.ItemCode
 	,cast(oh.SpecInstructions as varchar(250))[FOBPO]
 	,cast(sd.SpecialInstructions as varchar(250))[FOBItem]
-from CDC_SDV_WORK s inner join ReportsData..OrderDetail sd with (nolock) on sd.itemcode=s.itemcode
+from #CDC_SDV_WORK s inner join ReportsData..OrderDetail sd with (nolock) on sd.itemcode=s.itemcode
 	inner join ReportsData..OrderHeader oh with(nolock) on sd.PONumber=oh.PONumber
 where sd.PONumber not in (select distinct PONumber from #tmpPOs where ItemCode=sd.ItemCode) 
-	and sd.PONumber not in (select distinct p.LastPO from CDC_SDV_PENDING p)
+	and sd.PONumber not in (select distinct p.LastPO from #CDC_SDV_PENDING p)
 	and isnull(oh.SkeletonCreatedFrom,'')='' and oh.CreatedFromRequisition=0 and oh.CancelDate is null
 group by sd.ItemCode,oh.SpecInstructions,sd.SpecialInstructions
 
@@ -903,21 +911,21 @@ select
 	,s.ItemCode
 	,s.FOBPO
 	,s.FOBItem
-into CDC_SDV_POs
+into #CDC_SDV_POs
 from #tmpPOs s
 group by s.ItemCode,s.FOBPO,s.FOBItem
 
 
 /*UPDATE THE WORK TABLE WITH LAST PO*/
-update CDC_SDV_WORK
+update #CDC_SDV_WORK
 set FOBPO=s.FOBPO,FOBItem=s.FOBItem
-from CDC_SDV_WORK s 
-	inner join CDC_SDV_POs sd on sd.itemcode=s.itemcode
+from #CDC_SDV_WORK s 
+	inner join #CDC_SDV_POs sd on sd.itemcode=s.itemcode
 
 update t
 set t.FOBItem=cast(od.SpecialInstructions as varchar(250))
 	,t.FOBPO=cast(oh.SpecInstructions as varchar(250))
-from CDC_SDV_WORK t 
+from #CDC_SDV_WORK t 
 	inner join ReportsData..OrderDetail od on od.ItemCode=t.ItemCode and od.PONumber=t.LastPO
 	inner join ReportsData..OrderHeader oh on t.LastPO=oh.PONumber	
 where ISNULL(t.FOBItem,'')='' and isnull(od.SpecialInstructions,'')<>''
@@ -925,24 +933,24 @@ where ISNULL(t.FOBItem,'')='' and isnull(od.SpecialInstructions,'')<>''
 update t
 set t.FOBItem=cast(od.SpecialInstructions as varchar(250))
 	,t.FOBPO=cast(oh.SpecInstructions as varchar(250))
-from CDC_SDV_WORK t 
+from #CDC_SDV_WORK t 
 	inner join ReportsData..OrderDetail od on od.ItemCode=t.ItemCode and od.PONumber=t.LastPO
 	inner join ReportsData..OrderHeader oh on t.LastPO=oh.PONumber	
 where ISNULL(t.FOBPO,'')='' and isnull(oh.SpecInstructions,'')<>''
 
-update CDC_SDV_WORK
+update #CDC_SDV_WORK
 set LastPO=sd.PONumber
-from CDC_SDV_WORK s 
-	inner join CDC_SDV_POs sd on sd.itemcode=s.itemcode
+from #CDC_SDV_WORK s 
+	inner join #CDC_SDV_POs sd on sd.itemcode=s.itemcode
 where Parent<>'TBRI'
 
-drop table CDC_SDV_POs
+drop table #CDC_SDV_POs
 
 
 -- get last PO# from ProdMaster for Assortment Items.... 10/22/2010 JoeyB
-update CDC_SDV_WORK
+update #CDC_SDV_WORK
 set LastPO = pm.lastpurchaseorder
-from CDC_SDV_WORK s 
+from #CDC_SDV_WORK s 
 	inner join ReportsData..ProductMaster pm with (nolock) on pm.ItemCode = s.ItemCode
 where right(pm.ItemCode,8) > '19999999' or s.LastPO is null
 
@@ -950,11 +958,11 @@ where right(pm.ItemCode,8) > '19999999' or s.LastPO is null
 update c
 set c.Publisher=left(i.PublisherName,250)
 	,c.Author=left(i.Author,250)
-from CDC_SDV_WORK c 
+from #CDC_SDV_WORK c 
 	inner join ReportsData..ISBN13 i on i.ISBN=c.ISBN
 
 /*CAN THE PENDING TABLE*/
-drop table CDC_SDV_PENDING
+drop table #CDC_SDV_PENDING
 drop table #TBRIitems
 drop table #TBRIReceived
 
@@ -967,7 +975,7 @@ select
 into #BuyerPO
 from ReportsData..OrderHeader oh 
 	inner join ReportsData..OrderDetail od on oh.PONumber=od.PONumber
-	inner join CDC_SDV_WORK csw on csw.ItemCode=od.ItemCode
+	inner join #CDC_SDV_WORK csw on csw.ItemCode=od.ItemCode
 group by oh.PONumber,od.ItemCode
 
 update bp
@@ -976,50 +984,50 @@ from #BuyerPO bp
 	inner join ReportsData..OrderHeader oh with (nolock) on bp.PONumber=oh.PONumber and bp.PODate=oh.PODate
 	inner join ReportsData..Buyers b with (nolock) on b.BuyerID=oh.BuyerID
 
-update CDC_SDV_WORK
+update #CDC_SDV_WORK
 set Buyer=bp.Buyer
-from CDC_SDV_WORK s 
+from #CDC_SDV_WORK s 
 	inner join #BuyerPO bp on s.ItemCode=bp.ItemCode
 
 update s
 set s.Buyer=b.Name
-from CDC_SDV_WORK s 
+from #CDC_SDV_WORK s 
 	inner join ReportsData..OrderHeader oh on s.LastPO=oh.PONumber
 	inner join ReportsData..Buyers b on oh.BuyerID=b.BuyerID
 where ltrim(rtrim(ISNULL(s.Buyer,'')))=''
 
 -- Added the below update statement to update sectioncodes instead of doing a join.... 10/22/2010 JoeyB....
-update CDC_SDV_WORK 
+update #CDC_SDV_WORK 
 set SectionCode = UPPER(ISNULL(smd.SectionCode, 'NONE'))
-from CDC_SDV_WORK cdc 
+from #CDC_SDV_WORK cdc 
 	inner join ReportsData..SectionMasterForDIPS smd with (nolock) on smd.ItemCode = cdc.ItemCode
 
 /*DO SOME HOUSE CLEANING...*/
-delete from CDC_SDV_WORK 
+delete from #CDC_SDV_WORK 
 where VendorID = 'WHPBSUPPLY' or ReorderVendorID = 'WHPBSUPPLY' or SchemeID='ECOM'
 
-update CDC_SDV_WORK set QtyReturned=0 where QtyReturned is null
-update CDC_SDV_WORK set QtySold=0 where QtySold is null
-update CDC_SDV_WORK set RegisterPrice=0 where RegisterPrice is null
-update CDC_SDV_WORK set ExtendedAmt=0 where ExtendedAmt is null
-update CDC_SDV_WORK set QtyTrans=0 where QtyTrans is null
-update CDC_SDV_WORK set OnHand=0 where OnHand is null
-update CDC_SDV_WORK set Parent='' where Parent is null
-update CDC_SDV_WORK set Buyer='' where Buyer is null
-update CDC_SDV_WORK set AmtInvoiced = 0 where ISNULL(LastPO,'')=''
-update CDC_SDV_WORK set QtyDisc=0 where QtyDisc is null
-update CDC_SDV_WORK set DiscAmt=0 where DiscAmt is null
-update CDC_SDV_WORK set Coupons=0 where Coupons is null
-update CDC_SDV_WORK set CouponAmt=0 where CouponAmt is null
-update CDC_SDV_WORK set QtyDamaged=0 where QtyDamaged is null
-update CDC_SDV_WORK set QtyMarkedDown=0 where QtyMarkedDown is null
+update #CDC_SDV_WORK set QtyReturned=0 where QtyReturned is null
+update #CDC_SDV_WORK set QtySold=0 where QtySold is null
+update #CDC_SDV_WORK set RegisterPrice=0 where RegisterPrice is null
+update #CDC_SDV_WORK set ExtendedAmt=0 where ExtendedAmt is null
+update #CDC_SDV_WORK set QtyTrans=0 where QtyTrans is null
+update #CDC_SDV_WORK set OnHand=0 where OnHand is null
+update #CDC_SDV_WORK set Parent='' where Parent is null
+update #CDC_SDV_WORK set Buyer='' where Buyer is null
+update #CDC_SDV_WORK set AmtInvoiced = 0 where ISNULL(LastPO,'')=''
+update #CDC_SDV_WORK set QtyDisc=0 where QtyDisc is null
+update #CDC_SDV_WORK set DiscAmt=0 where DiscAmt is null
+update #CDC_SDV_WORK set Coupons=0 where Coupons is null
+update #CDC_SDV_WORK set CouponAmt=0 where CouponAmt is null
+update #CDC_SDV_WORK set QtyDamaged=0 where QtyDamaged is null
+update #CDC_SDV_WORK set QtyMarkedDown=0 where QtyMarkedDown is null
 
 
 ----update UPC/ISBN items to their parent itemcode..........
 update t
 set t.itemcode=u.reportitemcode
 	,t.Reorderable=(select top 1 Reorderable
-					from CDC_SDV_WORK
+					from #CDC_SDV_WORK
 					where ItemCode=u.reportitemcode)
 	,t.QtyShipped=0
 	,t.VendorID=(select top 1 pm.vendorid
@@ -1029,28 +1037,28 @@ set t.itemcode=u.reportitemcode
 						from ReportsData..ProductMaster pm
 						where pm.ItemCode=u.reportitemcode)
 	,t.Parent=(select top 1 Parent
-				from CDC_SDV_WORK
+				from #CDC_SDV_WORK
 				where ItemCode=u.reportitemcode)
 	,t.SchemeID=(select top 1 SchemeID
-				from CDC_SDV_WORK
+				from #CDC_SDV_WORK
 				where ItemCode=u.reportitemcode)
 	,t.LastReceived=(select top 1 LastReceived
-					from CDC_SDV_WORK
+					from #CDC_SDV_WORK
 					where ItemCode=u.reportitemcode)
 	,t.FirstReceived=(select top 1 FirstReceived
-					from CDC_SDV_WORK
+					from #CDC_SDV_WORK
 					where ItemCode=u.reportitemcode)
 	,t.Buyer=(select top 1 Buyer
-				from CDC_SDV_WORK
+				from #CDC_SDV_WORK
 				where ItemCode=u.reportitemcode)
 	,t.LastPO=(select top 1 LastPO
-				from CDC_SDV_WORK
+				from #CDC_SDV_WORK
 				where ItemCode=u.reportitemcode)
 	,t.ISBN=(select top 1 ISBN
-			from CDC_SDV_WORK
+			from #CDC_SDV_WORK
 			where ItemCode=u.reportitemcode)
 	,t.AmtInvoiced=0
-from CDC_SDV_WORK t 
+from #CDC_SDV_WORK t 
 	inner join #upcitems u on t.itemcode=u.itemcode
 
 select distinct
@@ -1090,7 +1098,7 @@ select distinct
 	,sum(isnull(QtyDisc,0))[QtyDisc]
 	,sum(isnull(DiscAmt,0))[DiscAmt]
 into #CDC_TradeShowRollUp
-from CDC_SDV_WORK
+from #CDC_SDV_WORK
 where ItemCode not in (select ItemCode from #upcItems) 
 	and Parent<>'TBRI'
 group by VendorID,ReorderVendorID,ItemCode,Parent,ISBN,ProductType,Buyer,SectionCode,Title,Cost,Price,MSRP,Reorderable
@@ -1133,7 +1141,7 @@ select
 	,CouponAmt
 	,QtyDisc
 	,DiscAmt
-from CDC_SDV_WORK
+from #CDC_SDV_WORK
 where Parent='TBRI'
 
 ----update results with any BT returns....
@@ -1151,6 +1159,7 @@ delete from #CDC_TradeShowRollUp
 		or ReorderVendorID = 'WHPBSUPPLY'
 
 ----get Wholesale values......
+-- !! Removed the group by's & replaced union with union all.
 select
 	g.ITEMNMBR
 	,sum(isnull(g.QUANTITY,0))[QUANTITY]
@@ -1167,8 +1176,7 @@ from(
 				as c on c.ItemCode=right('00000000000000000000'+ltrim(rtrim(sop.ITEMNMBR)),20)
 		where soph.SOPTYPE=3 and soph.CUSTNMBR not in ('SAMPLE','REPS') and soph.DOCID='STD' and soph.BCHSOURC !='Sales Void'
 			and soph.CUSTNMBR not like 'MRDC%' and soph.CUSTNMBR not like 'RDC%' and soph.CUSTNMBR not like 'TTB%'
-		group by sop.ITEMNMBR,sop.QTYTOINV,sop.XTNDPRCE
-	union
+	union all
 		select
 			sop.ITEMNMBR
 			,(sop.QTYTOINV)[QUANTITY]
@@ -1179,7 +1187,7 @@ from(
 				as c on c.ItemCode=right('00000000000000000000'+ltrim(rtrim(sop.ITEMNMBR)),20)
 		where soph.SOPTYPE=3 and soph.CUSTNMBR not in ('SAMPLE','REPS') and soph.DOCID='STD' and soph.BCHSOURC !='Sales Void'
 			and soph.CUSTNMBR not like 'MRDC%' and soph.CUSTNMBR not like 'RDC%' and soph.CUSTNMBR not like 'TTB%'
-		group by sop.ITEMNMBR,sop.QTYTOINV,sop.XTNDPRCE) g
+		) g
 group by g.ITEMNMBR
 
 
@@ -1198,12 +1206,11 @@ where tsr.Parent='RCVD'
 
 
 
-
 --clear the table for insert.....................................................................................................................................
-truncate table ReportsData..CDC_TradeShowRollUpNEW
+truncate table CDC_TradeShowRollUpNEW
 
 ------/*INSERT THE WORK TABLE DATA AS THE LATEST COPY...*/
-insert into ReportsData..CDC_TradeShowRollUpNEW(
+insert into CDC_TradeShowRollUpNEW(
 	VendorID, ReorderVendorID, ItemCode, Parent, ISBN, ProductType, Buyer, SectionCode, Title, 
 	Cost, Price, MSRP, QtyShipped, QtyTrans, QtyDamaged, QtySold, QtyMarkedDown, QtyReturned, 
 	QtyRTV, RegisterPrice, ExtendedAmt, OnHand, AmtInvoiced, Reorderable, LastPO, LastReceived, 
@@ -1230,7 +1237,7 @@ select
 	,QtyReturned
 	,isnull(br.TotalReturns,0)[TotalReturns]
 	,RegisterPrice
-	,ExtendedAmt
+	,tsr.ExtendedAmt
 	,OnHand
 	,AmtInvoiced
 	,Reorderable
@@ -1248,7 +1255,7 @@ select
 	,DiscAmt
 	,cast(isnull(txb.QUANTITY,0)as int)[TXBQty]
 	,cast(isnull(txb.XTNDPRCE,0)as money)[TXBAmt]
-	,os.OnlineQtySold
+	,isnull(os.OnlineQtySold,0)[OnlineQtySold]
 	,os.SellingPrice
 from #CDC_TradeShowRollUp tsr 
 	left join #BSRtn br on tsr.ItemCode=br.ItemCode
@@ -1258,34 +1265,34 @@ from #CDC_TradeShowRollUp tsr
 
 --------go back and update any missing FOBItems......
 if (select COUNT(*)
-	from ReportsData..CDC_TradeShowRollUpNEW t 
+	from CDC_TradeShowRollUpNEW t 
 		inner join ReportsData..OrderDetail od on od.ItemCode=t.ItemCode and od.PONumber=t.LastPO
 	where ISNULL(t.FOBItem,'')='' and isnull(od.SpecialInstructions,'')<>'') > 0
 	begin
 	update t
 		set t.FOBItem=cast(od.SpecialInstructions as varchar(250))
-		from ReportsData..CDC_TradeShowRollUpNEW t 
+		from CDC_TradeShowRollUpNEW t 
 			inner join ReportsData..OrderDetail od on od.ItemCode=t.ItemCode and od.PONumber=t.LastPO
 			inner join ReportsData..OrderHeader oh on t.LastPO=oh.PONumber	
 		where ISNULL(t.FOBItem,'')='' and isnull(od.SpecialInstructions,'')<>''
 	end
 
 if (select COUNT(*)
-	from ReportsData..CDC_TradeShowRollUpNEW t 
+	from CDC_TradeShowRollUpNEW t 
 		inner join ReportsData..OrderHeader oh on t.LastPO=oh.PONumber
 	where ISNULL(t.FOBPO,'')='' and isnull(oh.SpecInstructions,'')<>'') > 0
 	begin
 	update t
 		set t.FOBPO=cast(oh.SpecInstructions as varchar(250))
-		from ReportsData..CDC_TradeShowRollUpNEW t 
+		from CDC_TradeShowRollUpNEW t 
 			inner join ReportsData..OrderHeader oh on t.LastPO=oh.PONumber		
 		where ISNULL(t.FOBPO,'')='' and isnull(oh.SpecInstructions,'')<>''
 	end
 
 
 /*FINAL CLEANOUT*/
-drop table CDC_SDV_WORK
-drop table CDC_SDV_SalesData
+drop table #CDC_SDV_WORK
+drop table #CDC_SDV_SalesData
 drop table #CDC_TradeShowRollUp
 drop table #upcItems
 drop table #tmpPOs
@@ -1299,3 +1306,5 @@ drop table #online_sales
 
 ----------------------------------------------------------------------------------------------------------------------
 go
+
+
